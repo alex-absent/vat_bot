@@ -1,0 +1,25 @@
+import re
+import pytesseract
+from PIL import Image
+
+
+def extract_taxfree_number(image_path):
+    img = Image.open(image_path)
+
+    text = pytesseract.image_to_string(
+        img,
+        lang="pol+eng"
+    )
+
+    print("OCR TEXT:")
+    print(text)
+
+    match = re.search(
+        r"\d{2}PL\d{2}TF\d+",
+        text.replace(" ", "")
+    )
+
+    if match:
+        return match.group(0)
+
+    return None
