@@ -30,6 +30,30 @@ DATA_FILE = "saved_vat.json"
 LEGACY_LOG_FILE = "saved_vat.log"
 FILE_LOCK = asyncio.Lock()
 MAX_UPDATE_LIMIT = 10
+API_TIMEOUT = 15.0
+
+
+async def safe_get_vat_status(vat_number: str) -> tuple[bool, str]:
+    """Безопасно запрашивает статус с таймаутом. Возвращает (успех, текст_статуса)."""
+    try:
+        status = await asyncio.wait_for(
+            asyncio.to_thread(get_vat_status, vat_number),
+            timeout=API_TIMEOUT,
+        )
+        if not status or not str(status).strip():
+            return False, "⚠️ Сервис проверки вернул пустой ответ. Попробуйте позже."
+
+        low = str(status).lower()
+        error_markers = ("ошибка", "error", "timeout", "недоступен", "502", "503", "504", "connection")
+        if any(m in low for m in error_markers) and "не определён" not in low:
+            return False, f"⚠️ Сервис проверки TAX FREE временно недоступен.\n({status})"
+
+        return True, str(status)
+    except asyncio.TimeoutError:
+        return False, "⚠️ Сервис проверки TAX FREE не отвечает (превышено время ожидания). Попробуйте позже."
+    except Exception:
+        return False, "⚠️ Сервис проверки TAX FREE временно недоступен. Попробуйте позже."
+
 
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
@@ -194,7 +218,10 @@ async def vat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
 
     msg = await update.message.reply_text(f"⏳ Проверяю статус...\n\n{vat_number}")
-    status = await asyncio.to_thread(get_vat_status, vat_number)
+    is_ok, status = await safe_get_vat_status(vat_number)
+    if not is_ok:
+        await msg.edit_text(f"📄 TAX FREE\n\n{vat_number}\n\n{status}")
+        return
     await msg.edit_text(f"📄 TAX FREE\n\n{vat_number}\n\n{status}")
 
 
@@ -284,7 +311,9 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
             status = cached_status
         else:
             await query.edit_message_text(f"💾 Получаю статус и сохраняю...\n\n{vat_number}")
-            status = await asyncio.to_thread(get_vat_status, vat_number)
+            is_ok, status = await safe_get_vat_status(vat_number)
+            if not is_ok:
+                status = "⏳ Статус не проверен (сервис недоступен)"
 
         saved = await save_vat(vat_number, user_id, status)
 
@@ -300,7 +329,14 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     if action == "check":
         await query.edit_message_text(f"⏳ Проверяю статус...\n\n{vat_number}")
-        status = await asyncio.to_thread(get_vat_status, vat_number)
+        is_ok, status = await safe_get_vat_status(vat_number)
+        if not is_ok:
+            keyboard = [[InlineKeyboardButton("🔄 Повторить проверку", callback_data=f"check:{vat_number}")]]
+            await query.edit_message_text(
+                f"📄 TAX FREE\n\n{vat_number}\n\n{status}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
         context.user_data[cache_key] = status
 
         existing = await find_saved_vat(user_id, vat_number)
@@ -375,21 +411,29 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
         semaphore = asyncio.Semaphore(5)
 
-        async def fetch_status(vat_number: str) -> tuple[str, str]:
+        async def fetch_status(vat_number: str) -> tuple[str, bool, str]:
             async with semaphore:
-                new_status = await asyncio.to_thread(get_vat_status, vat_number)
-                return vat_number, new_status
+                is_ok, new_status = await safe_get_vat_status(vat_number)
+                return vat_number, is_ok, new_status
 
         updated_map: dict[str, str] = {}
+        failed_map: dict[str, str] = {}
         if to_fetch:
             fetched_results = await asyncio.gather(*(fetch_status(vat) for vat in to_fetch))
-            updated_map = dict(fetched_results)
-            await bulk_update_vat_statuses_in_file(user_id, updated_map)
+            for vat_number, is_ok, new_status in fetched_results:
+                if is_ok:
+                    updated_map[vat_number] = new_status
+                else:
+                    failed_map[vat_number] = new_status
+            if updated_map:
+                await bulk_update_vat_statuses_in_file(user_id, updated_map)
 
         text_result = f"✅ Обновление завершено ({total}/{MAX_UPDATE_LIMIT}):\n\n"
         for _, vat_number, old_status in ordered_numbers:
             if vat_number in updated_map:
                 final_status = updated_map[vat_number]
+            elif vat_number in failed_map:
+                final_status = f"{old_status}\n{failed_map[vat_number]}"
             else:
                 final_status = f"{old_status} (пропущено)"
             text_result += f"📄 {vat_number}\n📌 {final_status}\n\n"
