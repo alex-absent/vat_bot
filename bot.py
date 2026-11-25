@@ -117,6 +117,18 @@ async def save_vat(vat_number: str, user_id: int, status: str) -> bool:
         return True
 
 
+async def find_saved_vat(user_id: int, vat_number: str) -> dict[str, str] | None:
+    uid_str = str(user_id)
+    vat_number = normalize_vat(vat_number)
+
+    async with FILE_LOCK:
+        data = _load_data_sync()
+        for item in data.get(uid_str, []):
+            if item.get("vat") == vat_number:
+                return item
+    return None
+
+
 async def update_vat_status_in_file(user_id: int, vat_number: str, new_status: str) -> None:
     await bulk_update_vat_statuses_in_file(user_id, {normalize_vat(vat_number): new_status})
 
@@ -203,6 +215,22 @@ async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> N
             return
 
         vat_number = normalize_vat(vat_number)
+        user_id = update.effective_user.id
+
+        existing = await find_saved_vat(user_id, vat_number)
+        if existing:
+            keyboard = [
+                [InlineKeyboardButton("🔍 Проверить актуальный статус", callback_data=f"check:{vat_number}")],
+                [InlineKeyboardButton("📋 Мои номера", callback_data="my_numbers")],
+            ]
+            await update.message.reply_text(
+                f"ℹ️ Этот документ уже есть в сохранённых:\n\n"
+                f"📄 {vat_number}\n"
+                f"🕒 Добавлен: {existing.get('dt', '')}\n"
+                f"📌 Статус: {existing.get('status', 'Неизвестно')}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
+            return
 
         keyboard = [
             [InlineKeyboardButton("🔍 Проверить статус", callback_data=f"check:{vat_number}")],
