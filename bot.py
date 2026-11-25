@@ -385,6 +385,21 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         )
         return
 
+    existing = await find_saved_vat(user_id, vat_number)
+    if existing:
+        keyboard = [
+            [InlineKeyboardButton("🔍 Проверить актуальный статус", callback_data=f"check:{vat_number}")],
+            [InlineKeyboardButton("📋 Мои номера", callback_data="my_numbers")],
+        ]
+        await update.message.reply_text(
+            f"ℹ️ Этот документ уже есть в сохранённых:\n\n"
+            f"📄 {vat_number}\n"
+            f"🕒 Добавлен: {existing.get('dt', '')}\n"
+            f"📌 Статус: {existing.get('status', 'Неизвестно')}",
+            reply_markup=InlineKeyboardMarkup(keyboard),
+        )
+        return
+
     msg = await update.message.reply_text(f"⏳ Проверяю статус...\n\n{vat_number}")
     status = await asyncio.to_thread(get_vat_status, vat_number)
 
