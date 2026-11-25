@@ -1,4 +1,5 @@
 import asyncio
+import json
 import os
 import re
 import tempfile
@@ -25,8 +26,10 @@ from config import BOT_TOKEN
 from ocr import extract_taxfree_number
 from vat_status import get_vat_status
 
-LOG_FILE = "saved_vat.log"
+DATA_FILE = "saved_vat.json"
+LEGACY_LOG_FILE = "saved_vat.log"
 FILE_LOCK = asyncio.Lock()
+MAX_UPDATE_LIMIT = 10
 
 
 def get_main_keyboard() -> ReplyKeyboardMarkup:
@@ -48,109 +51,115 @@ def is_valid_vat(vat_number: str) -> bool:
     return bool(re.fullmatch(r"(\d{2}PL00)?TF\d+", vat_number))
 
 
-def _encode_status(status: str) -> str:
-    return status.replace("\n", "\\n").replace(";", ",")
+def _load_data_sync() -> dict[str, list[dict[str, str]]]:
+    if os.path.exists(DATA_FILE):
+        try:
+            with open(DATA_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                if isinstance(data, dict):
+                    return data
+        except (json.JSONDecodeError, OSError):
+            return {}
 
-
-def _decode_status(status: str) -> str:
-    return status.replace("\\n", "\n")
-
-
-async def save_vat(vat_number: str, user_id: int, status: str) -> bool:
-    vat_number = normalize_vat(vat_number)
-    uid_str = str(user_id)
-    safe_status = _encode_status(status)
-
-    async with FILE_LOCK:
-        if os.path.exists(LOG_FILE):
-            with open(LOG_FILE, "r", encoding="utf-8") as f:
-                for line in f:
-                    parts = line.strip().split(";")
-                    if len(parts) >= 3 and parts[1] == uid_str and parts[2] == vat_number:
-                        return False
-
-        with open(LOG_FILE, "a", encoding="utf-8") as f:
-            dt = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
-            f.write(f"{dt};{uid_str};{vat_number};{safe_status}\n")
-
-        return True
-
-
-async def update_vat_status_in_file(user_id: int, vat_number: str, new_status: str) -> None:
-    uid_str = str(user_id)
-    vat_number = normalize_vat(vat_number)
-    safe_status = _encode_status(new_status)
-
-    async with FILE_LOCK:
-        if not os.path.exists(LOG_FILE):
-            return
-
-        updated_lines = []
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split(";")
-                if len(parts) >= 3 and parts[1] == uid_str and parts[2] == vat_number:
-                    dt = parts[0]
-                    updated_lines.append(f"{dt};{uid_str};{vat_number};{safe_status}\n")
-                else:
-                    updated_lines.append(line)
-
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.writelines(updated_lines)
-
-
-async def get_user_numbers(user_id: int, limit: int = 20) -> list[tuple[str, str, str]]:
-    uid_str = str(user_id)
-    result = []
-
-    async with FILE_LOCK:
-        if not os.path.exists(LOG_FILE):
-            return []
-
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
+    migrated: dict[str, list[dict[str, str]]] = {}
+    if os.path.exists(LEGACY_LOG_FILE):
+        with open(LEGACY_LOG_FILE, "r", encoding="utf-8") as f:
             for line in f:
                 parts = line.strip().split(";")
                 if len(parts) == 4:
                     dt, uid, vat, status = parts
+                    status = status.replace("\\n", "\n")
                 elif len(parts) == 3:
                     dt, uid, vat = parts
                     status = "Статус не сохранён"
                 else:
                     continue
 
-                if uid == uid_str:
-                    result.append((dt, vat, _decode_status(status)))
+                migrated.setdefault(uid, []).append({
+                    "dt": dt,
+                    "vat": normalize_vat(vat),
+                    "status": status,
+                })
+        if migrated:
+            _save_data_sync(migrated)
 
-    return result[-limit:]
+    return migrated
 
 
-async def get_active_numbers(user_id: int) -> list[tuple[str, str]]:
-    all_numbers = await get_user_numbers(user_id, limit=100)
-    return [
-        (vat, status)
-        for _, vat, status in all_numbers
-        if "Возврат выплачен" not in status
-    ]
+def _save_data_sync(data: dict[str, list[dict[str, str]]]) -> None:
+    tmp_file = f"{DATA_FILE}.tmp"
+    with open(tmp_file, "w", encoding="utf-8") as f:
+        json.dump(data, f, ensure_ascii=False, indent=2)
+    os.replace(tmp_file, DATA_FILE)
+
+
+async def save_vat(vat_number: str, user_id: int, status: str) -> bool:
+    vat_number = normalize_vat(vat_number)
+    uid_str = str(user_id)
+
+    async with FILE_LOCK:
+        data = _load_data_sync()
+        user_list = data.setdefault(uid_str, [])
+
+        for item in user_list:
+            if item.get("vat") == vat_number:
+                return False
+
+        user_list.append({
+            "dt": f"{datetime.now():%Y-%m-%d %H:%M:%S}",
+            "vat": vat_number,
+            "status": status,
+        })
+        _save_data_sync(data)
+        return True
+
+
+async def update_vat_status_in_file(user_id: int, vat_number: str, new_status: str) -> None:
+    await bulk_update_vat_statuses_in_file(user_id, {normalize_vat(vat_number): new_status})
+
+
+async def bulk_update_vat_statuses_in_file(user_id: int, status_map: dict[str, str]) -> None:
+    if not status_map:
+        return
+
+    uid_str = str(user_id)
+    normalized_map = {normalize_vat(k): v for k, v in status_map.items()}
+
+    async with FILE_LOCK:
+        data = _load_data_sync()
+        user_list = data.get(uid_str, [])
+        changed = False
+
+        for item in user_list:
+            vat = item.get("vat")
+            if vat in normalized_map:
+                item["status"] = normalized_map[vat]
+                changed = True
+
+        if changed:
+            _save_data_sync(data)
+
+
+async def get_user_numbers(user_id: int, limit: int = MAX_UPDATE_LIMIT) -> list[tuple[str, str, str]]:
+    uid_str = str(user_id)
+
+    async with FILE_LOCK:
+        data = _load_data_sync()
+        user_list = data.get(uid_str, [])
+        return [
+            (item.get("dt", ""), item.get("vat", ""), item.get("status", "Статус не сохранён"))
+            for item in user_list[-limit:]
+        ]
 
 
 async def delete_user_numbers(user_id: int) -> None:
     uid_str = str(user_id)
 
     async with FILE_LOCK:
-        if not os.path.exists(LOG_FILE):
-            return
-
-        kept_lines = []
-        with open(LOG_FILE, "r", encoding="utf-8") as f:
-            for line in f:
-                parts = line.strip().split(";")
-                if len(parts) >= 2 and parts[1] != uid_str:
-                    kept_lines.append(line)
-
-        with open(LOG_FILE, "w", encoding="utf-8") as f:
-            f.writelines(kept_lines)
-
-
+        data = _load_data_sync()
+        if uid_str in data:
+            del data[uid_str]
+            _save_data_sync(data)
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     await update.message.reply_text(
         "Добро пожаловать в VAT TAX FREE Bot\n\n"
@@ -161,7 +170,7 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 async def vat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not context.args:
-        await update.message.reply_text("Пример:\n/vat TF003976030")
+        await update.message.reply_text("Пример:\n/vat 26PL00TF003976030")
         return
 
     vat_number = normalize_vat(context.args[0])
@@ -219,7 +228,7 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     user_id = query.from_user.id
 
     if data == "my_numbers":
-        numbers = await get_user_numbers(user_id)
+        numbers = await get_user_numbers(user_id, limit=MAX_UPDATE_LIMIT)
         if not numbers:
             await query.edit_message_text("📭 У вас пока нет сохранённых номеров")
             return
@@ -280,7 +289,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if "Мои номера" in text:
-        numbers = await get_user_numbers(user_id)
+        numbers = await get_user_numbers(user_id, limit=MAX_UPDATE_LIMIT)
         if not numbers:
             await update.message.reply_text("📭 У вас пока нет сохранённых номеров")
             return
@@ -293,35 +302,46 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         return
 
     if "Обновить статусы" in text:
-        all_numbers = await get_user_numbers(user_id)
-        if not all_numbers:
+        numbers_to_process = await get_user_numbers(user_id, limit=MAX_UPDATE_LIMIT)
+        if not numbers_to_process:
             await update.message.reply_text("📭 У вас пока нет сохранённых номеров")
             return
 
-        active_numbers = await get_active_numbers(user_id)
-        if not active_numbers:
-            await update.message.reply_text(
-                "✅ Все ваши документы уже имеют статус '💰 Возврат выплачен'"
+        ordered_numbers = list(reversed(numbers_to_process))
+        total = len(ordered_numbers)
+
+        to_fetch = [
+            vat for _, vat, status in ordered_numbers
+            if "Возврат выплачен" not in status
+        ]
+
+        if to_fetch:
+            msg = await update.message.reply_text(
+                f"⏳ Проверяю {len(to_fetch)} из {total} док. (выплаченные пропускаются)..."
             )
-            return
+        else:
+            msg = await update.message.reply_text("⏳ Формирую список статусов...")
 
-        msg = await update.message.reply_text("⏳ Подготовка проверки...")
-        results = []
-        total = len(active_numbers)
+        semaphore = asyncio.Semaphore(5)
 
-        for index, (vat_number, _) in enumerate(active_numbers, start=1):
-            progress = "🟩" * index + "⬜" * (total - index)
-            await msg.edit_text(
-                f"⏳ Проверяю {index}/{total}\n\n{vat_number}\n\n{progress}"
-            )
+        async def fetch_status(vat_number: str) -> tuple[str, str]:
+            async with semaphore:
+                new_status = await asyncio.to_thread(get_vat_status, vat_number)
+                return vat_number, new_status
 
-            new_status = await asyncio.to_thread(get_vat_status, vat_number)
-            await update_vat_status_in_file(user_id, vat_number, new_status)
-            results.append((vat_number, new_status))
+        updated_map: dict[str, str] = {}
+        if to_fetch:
+            fetched_results = await asyncio.gather(*(fetch_status(vat) for vat in to_fetch))
+            updated_map = dict(fetched_results)
+            await bulk_update_vat_statuses_in_file(user_id, updated_map)
 
-        text_result = "✅ Обновление завершено:\n\n"
-        for vat_number, status in results:
-            text_result += f"📄 {vat_number}\n📌 {status}\n\n"
+        text_result = f"✅ Обновление завершено ({total}/{MAX_UPDATE_LIMIT}):\n\n"
+        for _, vat_number, old_status in ordered_numbers:
+            if vat_number in updated_map:
+                final_status = updated_map[vat_number]
+            else:
+                final_status = f"{old_status} (пропущено)"
+            text_result += f"📄 {vat_number}\n📌 {final_status}\n\n"
 
         await msg.edit_text(text_result)
         return
@@ -330,7 +350,7 @@ async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     if not is_valid_vat(vat_number):
         await update.message.reply_text(
             "❓ Неизвестная команда или неверный формат номера.\n"
-            "Отправьте фото чека или введите номер вида TF003976030."
+            "Отправьте фото чека или введите номер вида 26PL00TF003976030."
         )
         return
 

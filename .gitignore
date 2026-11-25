@@ -7,3 +7,5 @@ saved_vat.log
 ocr.py_orig
 users.json
 bot.py_orig
+saved_vat.json
+*.tmp
