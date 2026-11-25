@@ -44,7 +44,10 @@ def get_main_keyboard() -> ReplyKeyboardMarkup:
 
 
 def normalize_vat(vat_number: str) -> str:
-    return vat_number.strip().upper()
+    cleaned = re.sub(r"[\s\-]+", "", vat_number).upper()
+    if re.fullmatch(r"TF\d+", cleaned):
+        return f"26PL00{cleaned}"
+    return cleaned
 
 
 def is_valid_vat(vat_number: str) -> bool:
