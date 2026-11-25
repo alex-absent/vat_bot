@@ -1,683 +1,364 @@
 import asyncio
-import tempfile
-import re
 import os
+import re
+import tempfile
 from datetime import datetime
-from telegram import BotCommand
 
 from telegram import (
-    Update,
+    BotCommand,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    ReplyKeyboardMarkup,
     KeyboardButton,
-    BotCommand
-)
-
-from telegram import (
+    ReplyKeyboardMarkup,
     Update,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup
 )
-
 from telegram.ext import (
     Application,
-    CommandHandler,
-    MessageHandler,
     CallbackQueryHandler,
+    CommandHandler,
     ContextTypes,
-    filters
+    MessageHandler,
+    filters,
 )
 
-from ocr import extract_taxfree_number
 from config import BOT_TOKEN
+from ocr import extract_taxfree_number
 from vat_status import get_vat_status
 
-
 LOG_FILE = "saved_vat.log"
+FILE_LOCK = asyncio.Lock()
 
-def get_main_keyboard():
+
+def get_main_keyboard() -> ReplyKeyboardMarkup:
     keyboard = [
         [KeyboardButton("📷 Сканировать VAT")],
         [KeyboardButton("📋 Мои номера")],
         [KeyboardButton("🔍 Проверить номер")],
         [KeyboardButton("🔄 Обновить статусы")],
-        [KeyboardButton("🗑 Удалить все записи")]
+        [KeyboardButton("🗑 Удалить все записи")],
     ]
+    return ReplyKeyboardMarkup(keyboard, resize_keyboard=True)
 
-    return ReplyKeyboardMarkup(
-        keyboard,
-        resize_keyboard=True
-    )
 
-def get_last_numbers(limit=20):
-    try:
-        with open(
-            LOG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
+def normalize_vat(vat_number: str) -> str:
+    return vat_number.strip().upper()
 
-            lines = f.readlines()
 
-        return lines[-limit:]
+def is_valid_vat(vat_number: str) -> bool:
+    return bool(re.fullmatch(r"(\d{2}PL00)?TF\d+", vat_number))
 
-    except FileNotFoundError:
-        return []
 
-def normalize_vat(vat_number):
+def _encode_status(status: str) -> str:
+    return status.replace("\n", "\\n").replace(";", ",")
 
-    vat_number = vat_number.strip().upper()
 
-    if re.match(r"\d{2}PL00TF\d+", vat_number):
-        return vat_number
+def _decode_status(status: str) -> str:
+    return status.replace("\\n", "\n")
 
-    if vat_number.startswith("TF"):
-        return vat_number
 
-    return vat_number
-
-def number_exists(user_id, vat_number):
-    if not os.path.exists(LOG_FILE):
-        return False
-
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split(";")
-
-            if len(parts) >= 3:
-                uid = parts[1]
-                vat = parts[2]
-
-                if uid == str(user_id) and vat == vat_number:
-                    return True
-
-    return False
-
-def get_user_numbers(
-    user_id,
-    limit=20
-):
-
-    print("SEARCH USER:", user_id)
-
-    try:
-
-        result = []
-
-        with open(
-            LOG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            for line in f:
-
-                print("RAW LINE:", line.strip())
-
-                parts = line.strip().split(";")
-
-                print("PARTS:", parts)
-
-                if len(parts) == 4:
-
-                    dt, uid, vat, status = parts
-
-                elif len(parts) == 3:
-
-                    dt, uid, vat = parts
-                    status = "Статус не сохранён"
-
-                else:
-
-                    print("SKIP BAD LINE")
-                    continue
-
-                print("UID FROM FILE:", uid)
-                print("USER REQUEST:", user_id)
-
-                if uid == str(user_id):
-
-                    print("MATCH FOUND!")
-
-                    result.append(
-                        (
-                            dt,
-                            vat,
-                            status
-                        )
-                    )
-
-        print("RESULT:", result)
-
-        return result[-limit:]
-
-    except FileNotFoundError:
-
-        print("FILE NOT FOUND")
-
-        return []
-
-def save_vat(
-    vat_number,
-    user_id,
-    status
-):
+async def save_vat(vat_number: str, user_id: int, status: str) -> bool:
     vat_number = normalize_vat(vat_number)
-    
-    if number_exists(user_id, vat_number):
-        return False
+    uid_str = str(user_id)
+    safe_status = _encode_status(status)
 
-    with open(
-        LOG_FILE,
-        "a",
-        encoding="utf-8"
-    ) as f:
+    async with FILE_LOCK:
+        if os.path.exists(LOG_FILE):
+            with open(LOG_FILE, "r", encoding="utf-8") as f:
+                for line in f:
+                    parts = line.strip().split(";")
+                    if len(parts) >= 3 and parts[1] == uid_str and parts[2] == vat_number:
+                        return False
 
-        f.write(
-            f"{datetime.now():%Y-%m-%d %H:%M:%S};"
-            f"{user_id};"
-            f"{vat_number};"
-            f"{status}\n"
-        )
+        with open(LOG_FILE, "a", encoding="utf-8") as f:
+            dt = f"{datetime.now():%Y-%m-%d %H:%M:%S}"
+            f.write(f"{dt};{uid_str};{vat_number};{safe_status}\n")
 
-    return True
-    
-def delete_user_numbers(user_id):
-    print("DELETE USER:", user_id)
+        return True
 
-    if not os.path.exists(LOG_FILE):
-        print("LOG FILE NOT FOUND")
-        return
 
-    lines = []
+async def update_vat_status_in_file(user_id: int, vat_number: str, new_status: str) -> None:
+    uid_str = str(user_id)
+    vat_number = normalize_vat(vat_number)
+    safe_status = _encode_status(new_status)
 
-    with open(LOG_FILE, "r", encoding="utf-8") as f:
-        for line in f:
-            parts = line.strip().split(";")
-
-            print("LINE:", parts)
-
-            if len(parts) >= 2:
-                uid = parts[1]
-
-                if uid != str(user_id):
-                    lines.append(line)
-
-    with open(LOG_FILE, "w", encoding="utf-8") as f:
-        f.writelines(lines)
-
-    print("DELETE COMPLETE")   
-
-def get_last_numbers(limit=20):
-
-    try:
-        with open(
-            LOG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            return f.readlines()[-limit:]
-
-    except FileNotFoundError:
-        return []
-        
-def get_active_numbers(user_id):
-
-    result = []
-
-    try:
-
-        with open(
-            LOG_FILE,
-            "r",
-            encoding="utf-8"
-        ) as f:
-
-            for line in f:
-
-                parts = line.strip().split(";")
-
-                if len(parts) != 4:
-                    continue
-
-                dt, uid, vat, status = parts
-
-                if uid != str(user_id):
-                    continue
-
-                if status == "💰 Возврат выплачен":
-                    continue
-
-                result.append(
-                    (vat, status)
-                )
-
-    except FileNotFoundError:
-        pass
-
-    return result
-        
- 
-async def start(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    await update.message.reply_text(
-        "Добро пожаловать в VAT TAX FREE Bot\n\n"
-        "📷 Отправьте фото чека\n"
-        "или выберите действие в меню.",
-        reply_markup=get_main_keyboard()
-    )    
-
-async def photo_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-    try:
-
-        photo = update.message.photo[-1]
-
-        file = await photo.get_file()
-
-        with tempfile.NamedTemporaryFile(
-            suffix=".jpg",
-            delete=False
-        ) as tmp:
-
-            await file.download_to_drive(
-                tmp.name
-            )
-
-            filename = tmp.name
-
-        vat_number = extract_taxfree_number(
-            filename
-        )
-
-        if not vat_number:
-            await update.message.reply_text(
-                "❌ Номер TAX FREE не найден"
-            )
+    async with FILE_LOCK:
+        if not os.path.exists(LOG_FILE):
             return
 
-        vat_number = normalize_vat(
-            vat_number
-        )
+        updated_lines = []
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(";")
+                if len(parts) >= 3 and parts[1] == uid_str and parts[2] == vat_number:
+                    dt = parts[0]
+                    updated_lines.append(f"{dt};{uid_str};{vat_number};{safe_status}\n")
+                else:
+                    updated_lines.append(line)
+
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(updated_lines)
+
+
+async def get_user_numbers(user_id: int, limit: int = 20) -> list[tuple[str, str, str]]:
+    uid_str = str(user_id)
+    result = []
+
+    async with FILE_LOCK:
+        if not os.path.exists(LOG_FILE):
+            return []
+
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(";")
+                if len(parts) == 4:
+                    dt, uid, vat, status = parts
+                elif len(parts) == 3:
+                    dt, uid, vat = parts
+                    status = "Статус не сохранён"
+                else:
+                    continue
+
+                if uid == uid_str:
+                    result.append((dt, vat, _decode_status(status)))
+
+    return result[-limit:]
+
+
+async def get_active_numbers(user_id: int) -> list[tuple[str, str]]:
+    all_numbers = await get_user_numbers(user_id, limit=100)
+    return [
+        (vat, status)
+        for _, vat, status in all_numbers
+        if "Возврат выплачен" not in status
+    ]
+
+
+async def delete_user_numbers(user_id: int) -> None:
+    uid_str = str(user_id)
+
+    async with FILE_LOCK:
+        if not os.path.exists(LOG_FILE):
+            return
+
+        kept_lines = []
+        with open(LOG_FILE, "r", encoding="utf-8") as f:
+            for line in f:
+                parts = line.strip().split(";")
+                if len(parts) >= 2 and parts[1] != uid_str:
+                    kept_lines.append(line)
+
+        with open(LOG_FILE, "w", encoding="utf-8") as f:
+            f.writelines(kept_lines)
+
+
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.message.reply_text(
+        "Добро пожаловать в VAT TAX FREE Bot\n\n"
+        "📷 Отправьте фото чека или выберите действие в меню.",
+        reply_markup=get_main_keyboard(),
+    )
+
+
+async def vat_command(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if not context.args:
+        await update.message.reply_text("Пример:\n/vat TF003976030")
+        return
+
+    vat_number = normalize_vat(context.args[0])
+    if not is_valid_vat(vat_number):
+        await update.message.reply_text("❌ Неверный формат номера TAX FREE.")
+        return
+
+    msg = await update.message.reply_text(f"⏳ Проверяю статус...\n\n{vat_number}")
+    status = await asyncio.to_thread(get_vat_status, vat_number)
+    await msg.edit_text(f"📄 TAX FREE\n\n{vat_number}\n\n{status}")
+
+
+async def photo_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    filename = None
+    try:
+        photo = update.message.photo[-1]
+        file = await photo.get_file()
+
+        with tempfile.NamedTemporaryFile(suffix=".jpg", delete=False) as tmp:
+            filename = tmp.name
+
+        await file.download_to_drive(filename)
+
+        vat_number = await asyncio.to_thread(extract_taxfree_number, filename)
+        if not vat_number:
+            await update.message.reply_text("❌ Номер TAX FREE не найден на фото")
+            return
+
+        vat_number = normalize_vat(vat_number)
 
         keyboard = [
-            [
-                InlineKeyboardButton(
-                    "🔍 Проверить статус",
-                    callback_data=f"check:{vat_number}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "💾 Сохранить номер",
-                    callback_data=f"save:{vat_number}"
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    "📋 Мои номера",
-                    callback_data="my_numbers"
-                )
-            ]
+            [InlineKeyboardButton("🔍 Проверить статус", callback_data=f"check:{vat_number}")],
+            [InlineKeyboardButton("💾 Сохранить номер", callback_data=f"save:{vat_number}")],
+            [InlineKeyboardButton("📋 Мои номера", callback_data="my_numbers")],
         ]
 
-        markup = InlineKeyboardMarkup(
-            keyboard
-        )
-
         await update.message.reply_text(
-            f"🔍 Найден номер:\n\n"
-            f"{vat_number}\n\n"
-            f"Выберите действие:",
-            reply_markup=markup
+            f"🔍 Найден номер:\n\n{vat_number}\n\nВыберите действие:",
+            reply_markup=InlineKeyboardMarkup(keyboard),
         )
 
     except Exception as e:
+        await update.message.reply_text(f"❌ Ошибка при обработке фото:\n{e}")
 
-        await update.message.reply_text(
-            f"Ошибка OCR:\n{e}"
-        )
+    finally:
+        if filename and os.path.exists(filename):
+            os.remove(filename)
 
 
-async def button_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
+async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     query = update.callback_query
-
     await query.answer()
 
     data = query.data
+    user_id = query.from_user.id
 
     if data == "my_numbers":
-
-        numbers = get_user_numbers(
-            query.from_user.id
-        )
-
+        numbers = await get_user_numbers(user_id)
         if not numbers:
-
-            await query.edit_message_text(
-                "📭 У вас пока нет сохранённых номеров"
-            )
-
+            await query.edit_message_text("📭 У вас пока нет сохранённых номеров")
             return
 
-        text = "📋 Мои номера\n\n"
-
+        text = "📋 Мои номера:\n\n"
         for dt, vat, status in reversed(numbers):
+            text += f"🕒 {dt}\n📄 {vat}\n📌 {status}\n\n"
 
-            text += (
-                f"{dt}\n"
-                f"{vat}\n"
-                f"{status}\n\n"
-            )
-
-        await query.edit_message_text(
-            text
-        )
-
+        await query.edit_message_text(text)
         return
 
-    action, vat_number = data.split(
-        ":",
-        1
-    )
+    if ":" not in data:
+        return
+
+    action, vat_number = data.split(":", 1)
 
     if action == "save":
-
-        await query.edit_message_text(
-            f"💾 Сохраняю...\n\n{vat_number}"
-        )
-
-        status = await asyncio.to_thread(
-            get_vat_status,
-            vat_number
-        )
-
-        saved = save_vat(
-            vat_number,
-            update.effective_user.id,
-            status
-        )
+        await query.edit_message_text(f"💾 Получаю статус и сохраняю...\n\n{vat_number}")
+        status = await asyncio.to_thread(get_vat_status, vat_number)
+        saved = await save_vat(vat_number, user_id, status)
 
         if not saved:
-            await update.message.reply_text(
-                "ℹ️ Такой номер уже сохранён"
+            await update_vat_status_in_file(user_id, vat_number, status)
+            await query.edit_message_text(
+                f"ℹ️ Номер уже был в списке (статус обновлён):\n\n{vat_number}\n\n{status}"
             )
             return
 
-        await query.edit_message_text(
-            f"✅ Сохранено\n\n"
-            f"{vat_number}\n\n"
-            f"{status}"
-        )
-
+        await query.edit_message_text(f"✅ Сохранено:\n\n{vat_number}\n\n{status}")
         return
 
     if action == "check":
+        await query.edit_message_text(f"⏳ Проверяю статус...\n\n{vat_number}")
+        status = await asyncio.to_thread(get_vat_status, vat_number)
+        await query.edit_message_text(f"📄 TAX FREE\n\n{vat_number}\n\n{status}")
 
-        await query.edit_message_text(
-            f"⏳ Проверяю статус...\n\n"
-            f"{vat_number}"
-        )
 
-        status = await asyncio.to_thread(
-            get_vat_status,
-            vat_number
-        )
-
-        await query.edit_message_text(
-            f"📄 TAX FREE\n\n"
-            f"{vat_number}\n\n"
-            f"{status}"
-        )
-
-        return
-
-async def vat(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
-    if not context.args:
-
-        await update.message.reply_text(
-            "Пример:\n"
-            "/vat TF003976030"
-        )
-
-        return
-
-    vat_number = normalize_vat(
-        context.args[0]
-    )
-
-    status = await asyncio.to_thread(
-        get_vat_status,
-        vat_number
-    )
-
-    await update.message.reply_text(
-        f"📄 TAX FREE\n\n"
-        f"{vat_number}\n\n"
-        f"{status}"
-    )
-
-async def post_init(application):
-    await application.bot.set_my_commands([
-        BotCommand("start", "Главное меню"),
-        BotCommand("vat", "Проверить номер")
-    ])
-
-async def text_handler(
-    update: Update,
-    context: ContextTypes.DEFAULT_TYPE
-):
-
+async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     text = update.message.text.strip()
-    
-    if text == "🗑 Удалить все записи":
+    user_id = update.effective_user.id
 
-        delete_user_numbers(
-            update.effective_user.id
-        )
-
-        await update.message.reply_text(
-            "✅ Все сохранённые номера удалены",
-            reply_markup=get_main_keyboard()
-        )
-
-        return
-    
-    print("TEXT=", repr(text))
-
-    if "Мои номера" in text:
-
-        numbers = get_user_numbers(
-            update.message.from_user.id
-        )
-
-        if not numbers:
-            await update.message.reply_text(
-                "📭 У вас пока нет сохранённых номеров"
-            )
-            return
-
-        result = "📋 Мои номера\n\n"
-
-        for dt, vat, status in reversed(numbers):
-
-            result += (
-                f"{dt}\n"
-                f"{vat}\n"
-                f"{status}\n\n"
-            )
-
-        await update.message.reply_text(
-            result
-        )
-
+    if "Сканировать VAT" in text:
+        await update.message.reply_text("📷 Отправьте фотографию документа TAX FREE")
         return
 
     if "Проверить номер" in text:
-
         await update.message.reply_text(
-            "Введите номер TAX FREE\n\n"
-            "Например:\n"
-            "26PL00TF003976030 (или TF003976030)"
+            "Введите номер TAX FREE\n\nНапример:\n26PL00TF003976030 или TF003976030"
         )
-
         return
-        
-    if "Удалить все записи" in text:
-        print("DELETE BUTTON PRESSED")
-        delete_user_numbers(update.effective_user.id)
 
+    if "Удалить все записи" in text:
+        await delete_user_numbers(user_id)
         await update.message.reply_text(
             "✅ Все ваши сохранённые номера удалены.",
-            reply_markup=get_main_keyboard()
+            reply_markup=get_main_keyboard(),
         )
         return
-    
-    if "Обновить статусы" in text:
 
-        numbers = get_active_numbers(
-            update.message.from_user.id
-        )
-
+    if "Мои номера" in text:
+        numbers = await get_user_numbers(user_id)
         if not numbers:
-
-            await update.message.reply_text(
-                "✅ Все документы уже имеют статус "
-                "'💰 Возврат выплачен'"
-            )
-
+            await update.message.reply_text("📭 У вас пока нет сохранённых номеров")
             return
 
-        msg = await update.message.reply_text(
-            "⏳ Подготовка проверки..."
-        )
+        result = "📋 Мои номера:\n\n"
+        for dt, vat, status in reversed(numbers):
+            result += f"🕒 {dt}\n📄 {vat}\n📌 {status}\n\n"
 
+        await update.message.reply_text(result)
+        return
+
+    if "Обновить статусы" in text:
+        all_numbers = await get_user_numbers(user_id)
+        if not all_numbers:
+            await update.message.reply_text("📭 У вас пока нет сохранённых номеров")
+            return
+
+        active_numbers = await get_active_numbers(user_id)
+        if not active_numbers:
+            await update.message.reply_text(
+                "✅ Все ваши документы уже имеют статус '💰 Возврат выплачен'"
+            )
+            return
+
+        msg = await update.message.reply_text("⏳ Подготовка проверки...")
         results = []
+        total = len(active_numbers)
 
-        total = len(numbers)
-
-        for index, (vat_number, old_status) in enumerate(
-            numbers,
-            start=1
-        ):
-
-            progress = (
-                "🟩" * index +
-                "⬜" * (total - index)
-            )
-
+        for index, (vat_number, _) in enumerate(active_numbers, start=1):
+            progress = "🟩" * index + "⬜" * (total - index)
             await msg.edit_text(
-                f"⏳ Проверяю {index}/{total}\n\n"
-                f"{vat_number}\n\n"
-                f"{progress}"
+                f"⏳ Проверяю {index}/{total}\n\n{vat_number}\n\n{progress}"
             )
 
-            status = await asyncio.to_thread(
-                get_vat_status,
-                vat_number
-            )
+            new_status = await asyncio.to_thread(get_vat_status, vat_number)
+            await update_vat_status_in_file(user_id, vat_number, new_status)
+            results.append((vat_number, new_status))
 
-            results.append(
-                (
-                    vat_number,
-                    status
-                )
-            )
-
-        text_result = (
-            "✅ Обновление завершено\n\n"
-        )
-
+        text_result = "✅ Обновление завершено:\n\n"
         for vat_number, status in results:
+            text_result += f"📄 {vat_number}\n📌 {status}\n\n"
 
-            text_result += (
-                f"{vat_number}\n"
-                f"{status}\n\n"
-            )
-
-        await msg.edit_text(
-        text_result
-        )
-
-        return   
-
-    if "Сканировать чек" in text:
-
-        await update.message.reply_text(
-            "📷 Отправьте фотографию документа TAX FREE"
-        )
-
+        await msg.edit_text(text_result)
         return
 
     vat_number = normalize_vat(text)
-
-    status = await asyncio.to_thread(
-        get_vat_status,
-        vat_number
-    )
-
-    await update.message.reply_text(
-        f"📄 TAX FREE\n\n"
-        f"{vat_number}\n\n"
-        f"{status}"
-    )
-
-def main():
-
-    app = (
-        Application.builder()
-        .token(BOT_TOKEN)
-        .build()
-    )
-
-    app.add_handler(
-        CommandHandler(
-            "start",
-            start
+    if not is_valid_vat(vat_number):
+        await update.message.reply_text(
+            "❓ Неизвестная команда или неверный формат номера.\n"
+            "Отправьте фото чека или введите номер вида TF003976030."
         )
+        return
+
+    msg = await update.message.reply_text(f"⏳ Проверяю статус...\n\n{vat_number}")
+    status = await asyncio.to_thread(get_vat_status, vat_number)
+
+    keyboard = [[InlineKeyboardButton("💾 Сохранить номер", callback_data=f"save:{vat_number}")]]
+    await msg.edit_text(
+        f"📄 TAX FREE\n\n{vat_number}\n\n{status}",
+        reply_markup=InlineKeyboardMarkup(keyboard),
     )
 
-    app.add_handler(
-        CommandHandler(
-            "vat",
-            vat
-        )
-    )
 
-    app.add_handler(
-        CallbackQueryHandler(
-            button_handler
-        )
-    )
+async def post_init(application: Application) -> None:
+    await application.bot.set_my_commands([
+        BotCommand("start", "Главное меню"),
+        BotCommand("vat", "Проверить номер"),
+    ])
 
-    app.add_handler(
-        MessageHandler(
-            filters.PHOTO,
-            photo_handler
-        )
-    )
 
-    app.add_handler(
-        MessageHandler(
-            filters.TEXT &
-            ~filters.COMMAND,
-            text_handler
-        )
-    )
+def main() -> None:
+    app = Application.builder().token(BOT_TOKEN).post_init(post_init).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("vat", vat_command))
+    app.add_handler(CallbackQueryHandler(button_handler))
+    app.add_handler(MessageHandler(filters.PHOTO, photo_handler))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, text_handler))
 
     app.run_polling()
 

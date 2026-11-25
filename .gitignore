@@ -1,21 +1,9 @@
-# Логи и временные файлы
-*.log
-*.tmp
-next_run
-*.json
-
-# Секреты и переменные окружения
-.env
-*.pem
-*.key
-
-# Системные файлы
-.DS_Store
-Thumbs.db
-
-# Зависимости и кэш (оставьте нужное для вашего языка)
 __pycache__/
 *.py[cod]
 venv/
 .venv/
-node_modules/
+config.py
+saved_vat.log
+ocr.py_orig
+users.json
+bot.py_orig
