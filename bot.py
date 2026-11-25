@@ -276,9 +276,16 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 
     action, vat_number = data.split(":", 1)
 
+    cache_key = f"status:{vat_number}"
+
     if action == "save":
-        await query.edit_message_text(f"💾 Получаю статус и сохраняю...\n\n{vat_number}")
-        status = await asyncio.to_thread(get_vat_status, vat_number)
+        cached_status = context.user_data.pop(cache_key, None)
+        if cached_status is not None:
+            status = cached_status
+        else:
+            await query.edit_message_text(f"💾 Получаю статус и сохраняю...\n\n{vat_number}")
+            status = await asyncio.to_thread(get_vat_status, vat_number)
+
         saved = await save_vat(vat_number, user_id, status)
 
         if not saved:
@@ -294,7 +301,20 @@ async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
     if action == "check":
         await query.edit_message_text(f"⏳ Проверяю статус...\n\n{vat_number}")
         status = await asyncio.to_thread(get_vat_status, vat_number)
-        await query.edit_message_text(f"📄 TAX FREE\n\n{vat_number}\n\n{status}")
+        context.user_data[cache_key] = status
+
+        existing = await find_saved_vat(user_id, vat_number)
+        if existing:
+            await update_vat_status_in_file(user_id, vat_number, status)
+            await query.edit_message_text(
+                f"📄 TAX FREE (статус в базе обновлён)\n\n{vat_number}\n\n{status}"
+            )
+        else:
+            keyboard = [[InlineKeyboardButton("💾 Сохранить номер", callback_data=f"save:{vat_number}")]]
+            await query.edit_message_text(
+                f"📄 TAX FREE\n\n{vat_number}\n\n{status}",
+                reply_markup=InlineKeyboardMarkup(keyboard),
+            )
 
 
 async def text_handler(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
